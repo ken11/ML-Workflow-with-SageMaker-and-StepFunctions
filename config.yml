@@ -1,0 +1,33 @@
+aws:
+  role:
+    sagemaker_execution: 
+    workflow_execution: 
+  bucket: 
+  ecr_repository_uri: 
+  input_data_s3_uri: 
+stepfunctions:
+  workflow:
+    name: 
+sagemaker:
+  experiment:
+    name: 
+  processing:
+    preprocess:
+      job_name_prefix: 
+      instance_count: 
+      instance_type: 
+      max_runtime_in_seconds: 
+    evaluation:
+      job_name_prefix: 
+      instance_count: 
+      instance_type: 
+      max_runtime_in_seconds: 
+  training:
+    job_name_prefix: 
+    instance_count: 
+    instance_type: 
+    use_spot_instances: 
+    max_run: 
+    max_wait: 
+    hyperparameters:
+      learning_rate: 
