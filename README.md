@@ -3,6 +3,7 @@
 I referred to [this notebook](https://github.com/aws-samples/amazon-sagemaker-examples-jp/blob/master/step-functions-data-science-sdk/model-train-evaluate-compare/step_functions_mlworkflow_scikit_learn_data_processing_and_model_evaluation_with_experiments.ipynb).  
 The contents of this repository make it easy to create ML Workflow without using a notebook.  
 As an example, run the MNIST preprocessing, training, and model evaluation processes in StepFunctions.  
+![example](https://user-images.githubusercontent.com/2043460/125785549-e8ffaa31-4f35-4592-a414-cd2dedefd607.png)
 
 ## How to use
 ### 1. Prepare the AWS environment
