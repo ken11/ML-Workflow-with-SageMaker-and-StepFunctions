@@ -5,12 +5,14 @@ import tensorflow as tf
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lr", type=str, default="3e-5")
+    parser.add_argument("--learning_rate", type=str, default="3e-5")
+    parser.add_argument("--epochs", type=str, default="1")
     args, _ = parser.parse_known_args()
 
-    print(f"learning_rate: {args.lr}")
+    print(f"learning_rate: {args.learning_rate}")
+    print(f"epochs: {args.epochs}")
 
-    training_data_directory = "/opt/ml/input/data/train"
+    training_data_directory = "/opt/ml/input/data/train_data"
     train_features_data = os.path.join(training_data_directory, "train_features.pkl")
     train_labels_data = os.path.join(training_data_directory, "train_labels.pkl")
     with open(train_features_data, 'rb') as f:
@@ -26,13 +28,13 @@ if __name__ == "__main__":
     ])
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     optimizer = tf.keras.optimizers.Adam(
-        learning_rate=float(args.lr)
+        learning_rate=float(args.learning_rate)
     )
     model.compile(optimizer=optimizer,
                   loss=loss_fn,
                   metrics=['accuracy'])
 
     # TODO: Make the number of epochs a hyperparameter
-    model.fit(x_train, y_train, epochs=5)
+    model.fit(x_train, y_train, epochs=int(args.epochs))
     model_output_directory = "/opt/ml/model"
     model.save(model_output_directory)

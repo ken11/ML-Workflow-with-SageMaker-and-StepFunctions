@@ -5,13 +5,17 @@ import boto3
 import sagemaker
 import stepfunctions
 import yaml
+import time
 from sagemaker.processing import (ProcessingInput, ProcessingOutput,
                                   ScriptProcessor)
 from sagemaker.tensorflow.estimator import TensorFlow
+from sagemaker.estimator import Estimator
 from smexperiments.experiment import Experiment
+from smexperiments.trial import Trial
 from stepfunctions import steps
 from stepfunctions.inputs import ExecutionInput
 from stepfunctions.steps import Chain, ProcessingStep
+from stepfunctions.steps.states import Retry
 from stepfunctions.workflow import Workflow
 
 
@@ -34,12 +38,18 @@ class MLWorkflow:
         self.evaluation_job_name_prefix = conf['sagemaker']['processing']['evaluation']['job_name_prefix']
 
         self.experiment_name = conf['sagemaker']['experiment']['name']
+        self.experiment_bucket_name = conf['sagemaker']['experiment']['bucket_name']
+        self.experiment_key = conf['sagemaker']['experiment']['key']
+        JST = timezone(timedelta(hours=+9), 'JST')
+        self.timestamp = datetime.now(JST).strftime("%Y-%m-%d-%H-%M-%S")
         self.hyperparameters = conf['sagemaker']['training']['hyperparameters']
         self.learning_rate = self.hyperparameters['learning_rate']
+        self.epochs = self.hyperparameters['epochs']
 
         self.preprocessor_settings = conf['sagemaker']['processing']['preprocess']
         self.estimator_settings = conf['sagemaker']['training']
         self.evaluation_processor_settings = conf['sagemaker']['processing']['evaluation']
+        self.lambda_function_name = conf['lambda']['function_name']
 
         self.input = conf['aws']['input_data_s3_uri']
 
@@ -55,17 +65,17 @@ class MLWorkflow:
                 "ExperimentName": str,
                 "EvaluationProcessingJobName": str,
                 "EvaluationProcessingOutput": str,
-                "EvaluationExperimentArgs": list,
             }
         )
 
-        self.experiment_evaluate = self._create_experiments(self.experiment_name)
+        self.experiment = self._create_experiments(self.experiment_name)
+        self.trial = self._create_trial(self.experiment_name)
 
     # Workflow creation
     def create(self):
-        preprocess_job_name, train_job_name, evaluation_job_name, timestamp = self._create_job_name()
+        preprocess_job_name, train_job_name, evaluation_job_name = self._create_job_name()
         s3_bucket_base_uri = f"s3://{self.bucket}"
-        output_data = f"{s3_bucket_base_uri}/data/processing/output-{timestamp}"
+        output_data = f"{s3_bucket_base_uri}/data/processing/output-{self.timestamp}"
         model_data_s3_uri = f"{s3_bucket_base_uri}/{train_job_name}/output/model.tar.gz"
         output_model_evaluation_s3_uri = f"{s3_bucket_base_uri}/{train_job_name}/evaluation"
 
@@ -73,6 +83,7 @@ class MLWorkflow:
         preprocess_step = self._preprocess()
         train_step, train_code = self._train(f"{s3_bucket_base_uri}/{train_job_name}/output")
         evaluation_step = self._evaluation()
+        lambda_step = self._lambda_step()
 
         # Create a step when it fails
         failed_state_sagemaker_processing_failure = stepfunctions.steps.states.Fail(
@@ -85,9 +96,10 @@ class MLWorkflow:
         preprocess_step.add_catch(catch_state_processing)
         train_step.add_catch(catch_state_processing)
         evaluation_step.add_catch(catch_state_processing)
+        lambda_step.add_catch(catch_state_processing)
 
         # execution
-        workflow_graph = Chain([preprocess_step, train_step, evaluation_step])
+        workflow_graph = Chain([preprocess_step, train_step, evaluation_step, lambda_step])
         branching_workflow = Workflow(
             name=self.workflow_name,
             definition=workflow_graph,
@@ -95,6 +107,9 @@ class MLWorkflow:
         )
         branching_workflow.create()
         branching_workflow.update(workflow_graph)
+
+        # NOTE: The update will not be reflected immediately, so you have to wait for a while.
+        time.sleep(5)
 
         branching_workflow.execute(
             inputs={
@@ -106,13 +121,13 @@ class MLWorkflow:
                 "TrainingParameters": {
                     "sagemaker_program": "train.py",
                     "sagemaker_submit_directory": train_code,
-                    "lr": self.learning_rate,
+                    "learning_rate": self.learning_rate,
+                    "epochs": self.epochs
                 },
                 "TrainingOutputModel": model_data_s3_uri,
-                "ExperimentName": self.experiment_evaluate.experiment_name,
+                "ExperimentName": self.experiment.experiment_name,
                 "EvaluationProcessingJobName": evaluation_job_name,
-                "EvaluationProcessingOutput": output_model_evaluation_s3_uri,
-                "EvaluationExperimentArgs": ['--experiment-name', self.experiment_evaluate.experiment_name]
+                "EvaluationProcessingOutput": output_model_evaluation_s3_uri
             }
         )
 
@@ -133,12 +148,12 @@ class MLWorkflow:
         # Define inputs and outputs
         inputs = [
             ProcessingInput(
-                source=self.execution_input["PreprocessingInputData"], destination="/opt/ml/processing/input", input_name="input-1"
+                source=self.execution_input["PreprocessingInputData"], destination="/opt/ml/processing/input", input_name="source_input"
             ),
             ProcessingInput(
                 source=input_code,
                 destination="/opt/ml/processing/input/code",
-                input_name="code",
+                input_name="preprocess_code",
             ),
         ]
         outputs = [
@@ -161,6 +176,11 @@ class MLWorkflow:
             job_name=self.execution_input["PreprocessingJobName"],
             inputs=inputs,
             outputs=outputs,
+            experiment_config={
+                "ExperimentName": self.execution_input["ExperimentName"],
+                'TrialName': self.trial.trial_name,
+                'TrialComponentDisplayName': 'Preprocess'
+            },
             container_entrypoint=[
                 "python3", "/opt/ml/processing/input/code/preprocess.py"
             ],
@@ -170,33 +190,59 @@ class MLWorkflow:
     def _train(self, model_dir):
         # NOTE: max_wait can be specified only when using spot instance.
         if self.estimator_settings['use_spot_instances']:
-            max_wait = self.max_wait
+            max_wait = self.estimator_settings['max_wait']
         else:
             max_wait = None
 
-        # https://sagemaker.readthedocs.io/en/stable/frameworks/tensorflow/sagemaker.tensorflow.html#tensorflow-estimator
-        estimator = TensorFlow(
-            entry_point="train.py",
-            instance_count=self.estimator_settings['instance_count'],
-            instance_type=self.estimator_settings['instance_type'],
-            use_spot_instances=self.estimator_settings['use_spot_instances'],
-            max_run=self.estimator_settings['max_run'],
-            max_wait=max_wait,
-            role=self.sagemaker_execution_role,
-            framework_version="2.4",
-            py_version="py37",
-            output_path=f"s3://{self.bucket}"
-        )
+        # NOTE: You can also use your own container image.
+        if self.estimator_settings['image_uri']:
+            estimator = Estimator(
+                image_uri=self.estimator_settings['image_uri'],
+                instance_count=self.estimator_settings['instance_count'],
+                instance_type=self.estimator_settings['instance_type'],
+                use_spot_instances=self.estimator_settings['use_spot_instances'],
+                max_run=self.estimator_settings['max_run'],
+                max_wait=max_wait,
+                role=self.sagemaker_execution_role,
+                output_path=f"s3://{self.bucket}",
+                metric_definitions=[
+                    {'Name': 'train:loss', 'Regex': '.*?loss: (.*?) -'},
+                    {'Name': 'train:accuracy', 'Regex': '.*?accuracy: (0.\\d+).*?'},
+                ],
+            )
+        else:
+            # https://sagemaker.readthedocs.io/en/stable/frameworks/tensorflow/sagemaker.tensorflow.html#tensorflow-estimator
+            estimator = TensorFlow(
+                entry_point="train.py",
+                instance_count=self.estimator_settings['instance_count'],
+                instance_type=self.estimator_settings['instance_type'],
+                use_spot_instances=self.estimator_settings['use_spot_instances'],
+                max_run=self.estimator_settings['max_run'],
+                max_wait=max_wait,
+                role=self.sagemaker_execution_role,
+                framework_version="2.4",
+                py_version="py37",
+                output_path=f"s3://{self.bucket}",
+                metric_definitions=[
+                    {'Name': 'train:loss', 'Regex': '.*?loss: (.*?) -'},
+                    {'Name': 'train:accuracy', 'Regex': '.*?accuracy: (0.\\d+).*?'},
+                ],
+            )
         train_code = self._upload('source.tar.gz', 'data/train/code')
 
         # https://aws-step-functions-data-science-sdk.readthedocs.io/en/v2.1.0/sagemaker.html?highlight=ProcessingStep#stepfunctions.steps.sagemaker.TrainingStep
         return steps.TrainingStep(
             "Training Step",
             estimator=estimator,
-            data={"train": sagemaker.TrainingInput(
+            data={"train_data": sagemaker.TrainingInput(
                 self.execution_input["PreprocessingOutputDataTrain"], content_type="application/octet-stream"
             )},
             job_name=self.execution_input["TrainingJobName"],
+            experiment_config={
+                "ExperimentName": self.execution_input["ExperimentName"],
+                'TrialName': self.trial.trial_name,
+                'TrialComponentDisplayName': 'Train'
+            },
             hyperparameters=self.execution_input["TrainingParameters"],
             wait_for_completion=True,
         ), train_code
@@ -217,17 +263,17 @@ class MLWorkflow:
             ProcessingInput(
                 source=self.execution_input["PreprocessingOutputDataTest"],
                 destination="/opt/ml/processing/test",
-                input_name="input-1",
+                input_name="test_data",
             ),
             ProcessingInput(
                 source=self.execution_input["TrainingOutputModel"],
                 destination="/opt/ml/processing/model",
-                input_name="input-2",
+                input_name="model",
             ),
             ProcessingInput(
                 source=evaluation_code,
                 destination="/opt/ml/processing/input/code",
-                input_name="code",
+                input_name="evaluation_code",
             ),
         ]
         outputs = [
@@ -244,18 +290,36 @@ class MLWorkflow:
             job_name=self.execution_input["EvaluationProcessingJobName"],
             inputs=inputs,
             outputs=outputs,
-            experiment_config={"ExperimentName": self.execution_input["ExperimentName"]},
-            container_arguments=self.execution_input["EvaluationExperimentArgs"],
+            experiment_config={
+                "ExperimentName": self.execution_input["ExperimentName"],
+                'TrialName': self.trial.trial_name,
+                'TrialComponentDisplayName': 'Evaluation'
+            },
             container_entrypoint=["python3", "/opt/ml/processing/input/code/evaluation.py"],
         )
 
+    def _lambda_step(self):
+        lambda_step = stepfunctions.steps.compute.LambdaStep(
+            "Upload Experiment",
+            parameters={
+                "FunctionName": self.lambda_function_name,
+                "Payload": {
+                    "experiment-name": self.experiment_name,
+                    "experiment_bucket_name": self.experiment_bucket_name,
+                    "experiment_key": self.experiment_key,
+                },
+            },
+        )
+        lambda_step.add_retry(
+            Retry(error_equals=["States.TaskFailed"], interval_seconds=15, max_attempts=2, backoff_rate=4.0)
+        )
+        return lambda_step
+
     def _create_job_name(self):
-        JST = timezone(timedelta(hours=+9), 'JST')
-        timestamp = datetime.now(JST).strftime("%Y-%m-%d-%H-%M-%S")
-        preprocess_job_name = f"{self.preprocess_job_name_prefix}-{timestamp}"
-        train_job_name = f"{self.train_job_name_prefix}-{timestamp}"
-        evaluation_job_name = f"{self.evaluation_job_name_prefix}-{timestamp}"
-        return preprocess_job_name, train_job_name, evaluation_job_name, timestamp
+        preprocess_job_name = f"{self.preprocess_job_name_prefix}-{self.timestamp}"
+        train_job_name = f"{self.train_job_name_prefix}-{self.timestamp}"
+        evaluation_job_name = f"{self.evaluation_job_name_prefix}-{self.timestamp}"
+        return preprocess_job_name, train_job_name, evaluation_job_name
 
     def _upload(self, file, prefix):
         return self.sagemaker_session.upload_data(
@@ -266,15 +330,22 @@ class MLWorkflow:
 
     def _create_experiments(self, experiment_name):
         try:
-            experiment_evaluate = Experiment.load(experiment_name=experiment_name)
+            experiment = Experiment.load(experiment_name=experiment_name)
         except Exception as ex:
             if "ResourceNotFound" in str(ex):
-                experiment_evaluate = Experiment.create(
+                experiment = Experiment.create(
                     experiment_name=experiment_name,
-                    description="model evaluation",
+                    description="example project experiments",
                     sagemaker_boto_client=boto3.client('sagemaker'))
 
-        return experiment_evaluate
+        return experiment
+
+    def _create_trial(self, experiment_name):
+        return Trial.create(
+            trial_name=self.timestamp,
+            experiment_name=self.experiment_name,
+            sagemaker_boto_client=boto3.client('sagemaker'),
+        )
 
 
 if __name__ == "__main__":
