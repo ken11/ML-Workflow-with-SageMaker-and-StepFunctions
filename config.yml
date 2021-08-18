@@ -11,6 +11,8 @@ stepfunctions:
 sagemaker:
   experiment:
     name: 
+    bucket_name: 
+    key: 
   processing:
     preprocess:
       job_name_prefix: 
@@ -31,3 +33,7 @@ sagemaker:
     max_wait: 
     hyperparameters:
       learning_rate: 
+      epochs: 
+    image_uri: 
+lambda:
+  function_name: 
