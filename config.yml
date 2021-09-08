@@ -9,6 +9,7 @@ stepfunctions:
   workflow:
     name: 
 sagemaker:
+  data_update:
   experiment:
     name: 
     bucket_name: 
@@ -36,4 +37,7 @@ sagemaker:
       epochs: 
     image_uri: 
 lambda:
-  function_name: 
+  experiments:
+    function_name: 
+  data_source:
+    function_name:
