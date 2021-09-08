@@ -15,7 +15,8 @@ from smexperiments.trial import Trial
 from stepfunctions import steps
 from stepfunctions.inputs import ExecutionInput
 from stepfunctions.steps import Chain, ProcessingStep
-from stepfunctions.steps.states import Retry
+from stepfunctions.steps.states import Retry, Choice, Fail, Catch
+from stepfunctions.steps.choice_rule import ChoiceRule
 from stepfunctions.workflow import Workflow
 
 
@@ -33,6 +34,7 @@ class MLWorkflow:
         self.bucket = conf['aws']['bucket']
         self.repository_uri = conf['aws']['ecr_repository_uri']
 
+        self.data_update = conf['sagemaker']['data_update']
         self.preprocess_job_name_prefix = conf['sagemaker']['processing']['preprocess']['job_name_prefix']
         self.train_job_name_prefix = conf['sagemaker']['training']['job_name_prefix']
         self.evaluation_job_name_prefix = conf['sagemaker']['processing']['evaluation']['job_name_prefix']
@@ -49,12 +51,13 @@ class MLWorkflow:
         self.preprocessor_settings = conf['sagemaker']['processing']['preprocess']
         self.estimator_settings = conf['sagemaker']['training']
         self.evaluation_processor_settings = conf['sagemaker']['processing']['evaluation']
-        self.lambda_function_name = conf['lambda']['function_name']
+        self.lambda_settings = conf['lambda']
 
         self.input = conf['aws']['input_data_s3_uri']
 
         self.execution_input = ExecutionInput(
             schema={
+                "DataUpdate": bool,
                 "PreprocessingJobName": str,
                 "PreprocessingInputData": str,
                 "PreprocessingOutputDataTrain": str,
@@ -80,26 +83,41 @@ class MLWorkflow:
         output_model_evaluation_s3_uri = f"{s3_bucket_base_uri}/{train_job_name}/evaluation"
 
         # Creating each step
+        data_source_step = self._data_source()
         preprocess_step = self._preprocess()
-        train_step, train_code = self._train(f"{s3_bucket_base_uri}/{train_job_name}/output")
-        evaluation_step = self._evaluation()
-        lambda_step = self._lambda_step()
+        train_step, train_code = self._train(f"{s3_bucket_base_uri}/{train_job_name}/output", data_source_step)
+        evaluation_step = self._evaluation(train_step)
+        experiment_upload_step = self._experiment_upload()
+
+        # Determine whether to execute preprocess.
+        # If there is a data update, preprocessing is executed.
+        # (Judged by the contents of the `DataUpdate` key of ExecutionInput)
+        choice_state = Choice("Determine whether to execute preprocess.")
+        choice_state.add_choice(
+            rule=ChoiceRule.BooleanEquals(variable="$.DataUpdate", value=True),
+            next_step=preprocess_step
+        )
+        choice_state.add_choice(
+            rule=ChoiceRule.BooleanEquals(variable="$.DataUpdate", value=False),
+            next_step=data_source_step
+        )
 
         # Create a step when it fails
-        failed_state_sagemaker_processing_failure = stepfunctions.steps.states.Fail(
+        failed_state_sagemaker_processing_failure = Fail(
             "ML Workflow failed", cause="SageMakerProcessingJobFailed"
         )
-        catch_state_processing = stepfunctions.steps.states.Catch(
+        catch_state_processing = Catch(
             error_equals=["States.TaskFailed"],
             next_step=failed_state_sagemaker_processing_failure,
         )
+        data_source_step.add_catch(catch_state_processing)
         preprocess_step.add_catch(catch_state_processing)
         train_step.add_catch(catch_state_processing)
         evaluation_step.add_catch(catch_state_processing)
-        lambda_step.add_catch(catch_state_processing)
+        experiment_upload_step.add_catch(catch_state_processing)
 
         # execution
-        workflow_graph = Chain([preprocess_step, train_step, evaluation_step, lambda_step])
+        workflow_graph = Chain([choice_state, preprocess_step, data_source_step, train_step, evaluation_step, experiment_upload_step])
         branching_workflow = Workflow(
             name=self.workflow_name,
             definition=workflow_graph,
@@ -113,6 +131,7 @@ class MLWorkflow:
 
         branching_workflow.execute(
             inputs={
+                "DataUpdate": self.data_update,
                 "PreprocessingJobName": preprocess_job_name,
                 "PreprocessingInputData": self.input,
                 "PreprocessingOutputDataTrain": output_data + '/train_data',
@@ -130,6 +149,27 @@ class MLWorkflow:
                 "EvaluationProcessingOutput": output_model_evaluation_s3_uri
             }
         )
+
+    # Select a data source according to whether the data has been updated.
+    # If the data has not been updated, select the latest preprocessed data from the past Experiments data.
+    def _data_source(self):
+        step = stepfunctions.steps.compute.LambdaStep(
+            "data source",
+            parameters={
+                "FunctionName": self.lambda_settings['data_source']['function_name'],
+                "Payload": {
+                    "StateInput.$": "$",
+                    "data_update": self.execution_input["DataUpdate"],
+                    "experiment-name": self.experiment_name,
+                    "bucket_name": self.bucket,
+                    "job": "data_source"
+                },
+            },
+        )
+        step.add_retry(
+            Retry(error_equals=["States.TaskFailed"], interval_seconds=15, max_attempts=2, backoff_rate=4.0)
+        )
+        return step
 
     # pre-process step creation
     def _preprocess(self):
@@ -187,7 +227,7 @@ class MLWorkflow:
         )
 
     # training step creation
-    def _train(self, model_dir):
+    def _train(self, model_dir, step):
         # NOTE: max_wait can be specified only when using spot instance.
         if self.estimator_settings['use_spot_instances']:
             max_wait = self.estimator_settings['max_wait']
@@ -235,7 +275,7 @@ class MLWorkflow:
             "Training Step",
             estimator=estimator,
             data={"train_data": sagemaker.TrainingInput(
-                self.execution_input["PreprocessingOutputDataTrain"], content_type="application/octet-stream"
+                step.output()["Payload"]["train_data"], content_type="application/octet-stream"
             )},
             job_name=self.execution_input["TrainingJobName"],
             experiment_config={
@@ -245,23 +285,24 @@ class MLWorkflow:
             },
             hyperparameters=self.execution_input["TrainingParameters"],
             wait_for_completion=True,
+            result_path="$.TrainResult"
         ), train_code
 
     # evaluation step creation
-    def _evaluation(self):
+    def _evaluation(self, step):
         evaluation_processor = ScriptProcessor(
             command=['python3'],
             image_uri=self.repository_uri,
             role=self.sagemaker_execution_role,
             sagemaker_session=self.sagemaker_session,
-            instance_count=1,
-            instance_type='ml.m5.xlarge',
-            max_runtime_in_seconds=600
+            instance_count=self.evaluation_processor_settings['instance_count'],
+            instance_type=self.evaluation_processor_settings['instance_type'],
+            max_runtime_in_seconds=self.evaluation_processor_settings['max_runtime_in_seconds']
         )
         evaluation_code = self._upload('evaluation.py', "data/evaluation/code")
         inputs = [
             ProcessingInput(
-                source=self.execution_input["PreprocessingOutputDataTest"],
+                source=step.output()["Payload"]["test_data"],
                 destination="/opt/ml/processing/test",
                 input_name="test_data",
             ),
@@ -298,22 +339,23 @@ class MLWorkflow:
             container_entrypoint=["python3", "/opt/ml/processing/input/code/evaluation.py"],
         )
 
-    def _lambda_step(self):
-        lambda_step = stepfunctions.steps.compute.LambdaStep(
+    def _experiment_upload(self):
+        step = stepfunctions.steps.compute.LambdaStep(
             "Upload Experiment",
             parameters={
-                "FunctionName": self.lambda_function_name,
+                "FunctionName": self.lambda_settings['experiments']['function_name'],
                 "Payload": {
                     "experiment-name": self.experiment_name,
                     "experiment_bucket_name": self.experiment_bucket_name,
                     "experiment_key": self.experiment_key,
+                    "job": "experiment_upload"
                 },
             },
         )
-        lambda_step.add_retry(
+        step.add_retry(
             Retry(error_equals=["States.TaskFailed"], interval_seconds=15, max_attempts=2, backoff_rate=4.0)
         )
-        return lambda_step
+        return step
 
     def _create_job_name(self):
         preprocess_job_name = f"{self.preprocess_job_name_prefix}-{self.timestamp}"
